@@ -108,7 +108,7 @@ from powercontext.builtin.inference import (
     embed_query,
 )
 from powercontext.builtin.tags import TagFilter
-from powercontext.errors import RevisionConflictError
+from powercontext.errors import ArtifactNotFoundError, RevisionConflictError
 from powercontext.sources import (
     TEXT_EVIDENCE_PROJECTION_KEY,
     Source,
@@ -929,9 +929,17 @@ class MemoryService:
 
     async def _validate_search_heads(self, memories: tuple[Memory, ...]) -> None:
         for memory in memories:
-            exact = await self._backend.get(memory.as_ref())
-            latest = await self._backend.latest(memory.artifact_id)
-            if exact != memory or exact.as_ref() != latest.as_ref():
+            reference = memory.as_ref()
+            try:
+                latest = await self._backend.latest(memory.artifact_id)
+            except ArtifactNotFoundError:
+                await self._backend.get(reference)
+                raise
+            if latest.as_ref() != reference:
+                # Distinguish an existing historical revision from a missing one.
+                await self._backend.get(reference)
+                raise CapabilityNotSupportedError("head")
+            if latest != memory:
                 raise CapabilityNotSupportedError("head")
 
     async def _select_search_mode(
@@ -949,6 +957,15 @@ class MemoryService:
         embedding_profile = None if self._embedding_model is None else self._embedding_model.profile
         profile = capabilities.embedding_profile
         profile_matches = profile is not None and embedding_profile == profile
+        if requested == "hybrid":
+            # The task scope leaves incomplete-embedding handling out of the
+            # hybrid candidate query: the caller supplies the exact profile and
+            # query vector, and the single statement applies them. Keeping this
+            # path free of a completeness probe makes the candidate retrieval one
+            # statement instead of a probe followed by the candidate query.
+            if not (capabilities.hybrid and profile_matches):
+                raise CapabilityNotSupportedError("hybrid")
+            return "hybrid"
         vector_complete = (
             await self._backend.vector_complete(memories, profile)
             if capabilities.vector and profile_matches and profile is not None
@@ -961,10 +978,6 @@ class MemoryService:
             if not vector_available:
                 raise CapabilityNotSupportedError("vector")
             return "vector"
-        if requested == "hybrid":
-            if not hybrid_available:
-                raise CapabilityNotSupportedError("hybrid")
-            return "hybrid"
         if requested == "auto":
             if hybrid_available:
                 return "hybrid"
