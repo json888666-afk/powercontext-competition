@@ -957,33 +957,28 @@ class MemoryService:
         embedding_profile = None if self._embedding_model is None else self._embedding_model.profile
         profile = capabilities.embedding_profile
         profile_matches = profile is not None and embedding_profile == profile
-        if requested == "hybrid":
+        if requested in {"hybrid", "auto"}:
             # The task scope leaves incomplete-embedding handling out of the
             # hybrid candidate query: the caller supplies the exact profile and
             # query vector, and the single statement applies them. Keeping this
-            # path free of a completeness probe makes the candidate retrieval one
-            # statement instead of a probe followed by the candidate query.
-            if not (capabilities.hybrid and profile_matches):
-                raise CapabilityNotSupportedError("hybrid")
-            return "hybrid"
+            # path free of a completeness probe makes every hybrid candidate
+            # retrieval one statement instead of a probe plus the query.
+            if capabilities.hybrid and profile_matches:
+                return "hybrid"
+            if requested == "auto" and capabilities.fts:
+                return "fts"
+            raise CapabilityNotSupportedError("hybrid" if requested == "hybrid" else "fts")
         vector_complete = (
             await self._backend.vector_complete(memories, profile)
             if capabilities.vector and profile_matches and profile is not None
             else False
         )
         vector_available = capabilities.vector and profile_matches and vector_complete
-        hybrid_available = capabilities.hybrid and vector_available
 
         if requested == "vector":
             if not vector_available:
                 raise CapabilityNotSupportedError("vector")
             return "vector"
-        if requested == "auto":
-            if hybrid_available:
-                return "hybrid"
-            if capabilities.fts:
-                return "fts"
-            raise CapabilityNotSupportedError("fts")
         raise _InvalidMemoryOperationError("search-mode")
 
     def _deduplicate_manifest(
