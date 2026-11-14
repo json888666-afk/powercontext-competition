@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy import Table
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -55,6 +55,21 @@ def memory_channel_hits(
         for row in rows
         if str(row["memory_artifact_id"]) in requested
     )
+
+
+@runtime_checkable
+class _NativeHybridMemoryIndex(Protocol):
+    """One seekdb statement that returns both ordered candidate channels."""
+
+    native_hybrid_search: bool
+
+    async def search_hybrid(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        request: MemorySearchRequest,
+        /,
+    ) -> MemorySearchChannels: ...
 
 
 class MemoryIndex(Protocol):
@@ -247,6 +262,16 @@ class CompositeMemoryIndex:
         request: MemorySearchRequest,
         /,
     ) -> MemorySearchChannels:
+        if request.mode == "hybrid":
+            # A native hybrid index returns both channels from one statement so
+            # the database plans the full-text scan and the vector scan together.
+            native = tuple(
+                index
+                for index in self.indexes
+                if isinstance(index, _NativeHybridMemoryIndex) and index.native_hybrid_search is True
+            )
+            if len(native) == 1:
+                return await native[0].search_hybrid(connection, scope_id, request)
         fts: tuple[MemoryChannelHit, ...] = ()
         vector: tuple[MemoryChannelHit, ...] = ()
         for index in self.indexes:
