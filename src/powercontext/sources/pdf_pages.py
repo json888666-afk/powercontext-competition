@@ -18,10 +18,10 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections import Counter
+from collections import Counter, defaultdict
 from hashlib import sha256
 from io import BytesIO
-from math import log1p
+from math import log
 from typing import TYPE_CHECKING, Annotated, NamedTuple, cast
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
@@ -153,214 +153,434 @@ class _PDFPageProjection:
 
 PDF_PAGE_SOURCE_DEFINITION = AdapterSourceDefinition(_PDFPageAdapter(), projections=(_PDFPageProjection(),))
 
-_WORDS = re.compile(r"[^\W_]+")
-_YEAR = re.compile(r"(?:fy)?((?:19|20)\d{2})(?:q[1-4])?")
-_QUERY_FILLER = frozenset([
+# ---------------------------------------------------------------------------
+# Deterministic, offline evidence-page retrieval over one scoped Memory.
+#
+# Every physical page is one Memory entry whose text is ``document_id\nPAGE_TEXT``.
+# The ranker rebuilds a compact in-process index from one exact Memory snapshot,
+# applies BM25 over the question terms plus disclosure-structure signals (primary
+# statement pages, MD&A/segment sections, page headings, numeric density), and
+# keeps a small number of reserved slots for primary statements so a single
+# repeated term cannot crowd out the page that actually carries the evidence.
+# ---------------------------------------------------------------------------
+
+_WORD = re.compile(r"[a-z]+|\d+")
+_YEAR = re.compile(r"(?:19|20)\d{2}")
+_STOP = frozenset({
+    "a",
     "about",
-    "according",
-    "answer",
-    "based",
-    "calculate",
-    "define",
-    "details",
-    "following",
-    "give",
-    "many",
-    "much",
-    "only",
-    "reported",
-    "respond",
-    "shown",
-    "using",
-    "use",
-    "year",
-    "fy",
-    "fiscal",
-    "end",
-    "ended",
-    "statement",
-    "statements",
-    "financial",
-    "company",
-    "filing",
-    "annual",
-    "report",
-    "form",
+    "an",
+    "and",
     "any",
-    "materially",
-    "directly",
-    "explicitly",
-    "outlined",
-    "primarily",
-])
-
-
-class _Topic(NamedTuple):
-    question: re.Pattern[str]
-    terms: str
-    evidence: re.Pattern[str]
-
-
-# Annual reports use different headings and line item names for the same disclosure.
-_TOPICS = (
-    _Topic(
-        re.compile(
-            r"\b(?:cash flows?|capex|capital expenditures?|d a|depreciation and amortization|"
-            r"cash (?:provided|generated|received|used) (?:by|from|in) operat\w+|"
-            r"(?:investing|investments?|purchases?) in property|property (?:plant )?and equipment)\b"
-        ),
-        "cash flows operating activities investing financing capital expenditures additions property plant equipment",
-        re.compile(r"\b(?:statements? of (?:consolidated )?cash flows?|cash flows? statements?)\b"),
-    ),
-    _Topic(
-        re.compile(
-            r"\b(?:income statements?|p l|p and l|statements? of (?:operations|earnings|income)|"
-            r"ebitda|operating (?:income|profit|margin)|net (?:income|earnings|loss|sales|revenue)|"
-            r"gross (?:profit|margin)|return on (?:assets|equity)|cost of (?:sales|revenue|goods sold))\b"
-        ),
-        "consolidated statements income operations earnings profit net sales revenues cost",
-        re.compile(
-            r"\b(?:statements? of (?:consolidated )?(?:income|operations|earnings|profit and loss)|"
-            r"income statements?|statements? of (?:comprehensive )?income and comprehensive income)\b"
-        ),
-    ),
-    _Topic(
-        re.compile(
-            r"\b(?:balance sheets?|financial position|(?:total|current) (?:assets|liabilities)|"
-            r"(?:current|quick) ratio|working capital|total (?:debt|equity)|return on (?:assets|equity)|"
-            r"debt to equity|shareholders? equity|stockholders? equity)\b"
-        ),
-        "balance sheets financial position assets liabilities equity current",
-        re.compile(r"\b(?:balance sheets?|statements? of (?:consolidated )?financial position)\b"),
-    ),
-    _Topic(
-        re.compile(r"\b(?:geograph\w*|countries|regions?|where .* operat\w+)\b"),
-        "geographic geographical regions countries markets divisions business segments operations international",
-        re.compile(r"\b(?:geograph\w*|our divisions|business segments?|international operations)\b"),
-    ),
-    _Topic(
-        re.compile(r"\b(?:legal|lawsuits?|litigation)\b"),
-        "legal proceedings litigation lawsuits claims commitments contingencies",
-        re.compile(r"\b(?:legal proceedings|legal matters|litigation|(?:commitments and|loss) contingencies)\b"),
-    ),
-    _Topic(
-        re.compile(r"\b(?:employees?|headcount|workforce|personnel|staffing|human capital)\b"),
-        "employees employed employment headcount workforce personnel staff",
-        re.compile(r"\b(?:employees|workforce|human capital(?: management)?)\b"),
-    ),
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "being",
+    "both",
+    "but",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "each",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "how",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "may",
+    "of",
+    "on",
+    "or",
+    "our",
+    "please",
+    "should",
+    "than",
+    "that",
+    "the",
+    "their",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "to",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "will",
+    "with",
+    "would",
+    "you",
+    "your",
+})
+# Answer-writing instructions carry no evidence and dilute a long natural question.
+_INSTRUCTION = re.compile(
+    r"(respond to the question|give a response|answer in |answer concisely|please state|"
+    r"state that and explain|explain why|assuming the perspective|relying on the details|"
+    r"use only the|based on the details shown|from the statement of cash flows and the)"
 )
+_STATEMENTS = {
+    "income": re.compile(
+        r"(?:consolidated )?statements? of (?:consolidated )?(?:income|earnings|operations)"
+        r"|consolidated statements? of income"
+    ),
+    "balance": re.compile(r"balance sheets?|statements? of (?:consolidated )?financial position"),
+    "cashflow": re.compile(r"statements? of (?:consolidated )?cash flows?"),
+}
+_SECTIONS = {
+    "mda": re.compile(
+        r"results of operations|analysis of consolidated|management.s discussion|executive overview|our business"
+    ),
+    "segment": re.compile(
+        r"business segment|reportable segment|segment results|sales and operating income|performance by business"
+    ),
+    "notes": re.compile(r"note \d+|notes to (?:the )?consolidated financial statements"),
+}
+# Metric vocabulary that identifies which disclosure carries the evidence.
+_LEXICON = (
+    (
+        re.compile(r"capital[ -]?intensive"),
+        ("capital expenditures", "property plant equipment", "capex", "purchases of property"),
+    ),
+    (re.compile(r"liquidity|quick ratio|current ratio"), ("current assets", "current liabilities", "quick", "liquid")),
+    (re.compile(r"\bdebt\b|borrowings"), ("long term debt", "debt", "borrowings")),
+    (re.compile(r"inventory turnover|sold its inventory"), ("inventories", "cost of sales", "cost of products sold")),
+    (re.compile(r"customer concentration"), ("customer", "customers", "net revenue", "accounted for")),
+    (re.compile(r"gross margin|gross profit"), ("gross profit", "cost of products sold", "cost of sales")),
+    (re.compile(r"operating margin|operating income|operating profit"), ("operating income", "operating profit")),
+    (re.compile(r"revenue|sales"), ("net sales", "revenues", "sales")),
+    (re.compile(r"segment"), ("business segment", "segments", "segment")),
+    (re.compile(r"growth|grow"), ("results of operations", "sales increased", "growth")),
+    (re.compile(r"ebitda|depreciation|amortization|capex"), ("depreciation", "amortization", "cash flows")),
+    (re.compile(r"employees|workforce|headcount"), ("employees", "workforce")),
+    (re.compile(r"legal|litigation|lawsuit"), ("legal proceedings", "litigation", "contingencies")),
+    (re.compile(r"geograph|region|country|countries"), ("countries", "territories", "regions", "operations")),
+)
+_TOPIC_STATEMENTS = (
+    (
+        re.compile(r"capital[ -]?intensive|capex|cash flow|ebitda|depreciation"),
+        frozenset({"cashflow", "balance", "income"}),
+    ),
+    (re.compile(r"liquidity|quick ratio|current ratio|working capital"), frozenset({"balance"})),
+    (re.compile(r"gross margin|operating margin|revenue|sales|growth|earnings"), frozenset({"income"})),
+    (re.compile(r"inventory"), frozenset({"balance", "income"})),
+    (re.compile(r"debt|borrowings"), frozenset({"balance", "cashflow"})),
+)
+_TOPIC_SECTIONS = (
+    (re.compile(r"drove|drive|change|gross margin|operating margin|revenue|sales|growth"), frozenset({"mda"})),
+    (re.compile(r"segment"), frozenset({"segment"})),
+)
+_NUMERIC_QUESTION = re.compile(r"ratio|margin|percent|amount|how many|value|cost|revenue|sales|growth|calculate")
+
+_K1 = 1.2
+_B = 0.75
+_STATEMENT_BOOST = 8.0
+_SECTION_BOOST = 5.0
+_HEADING_BOOST = 2.0
+_NUMERIC_BOOST = 1.5
+_MAX_STATEMENT_SLOTS = 6
+_MAX_SECTION_SLOTS = 4
+_MAX_CACHED_SCOPES = 4
 
 
-def _term(word: str) -> str:
+def _stem(word: str) -> str:
     if len(word) > 4 and word.endswith("ies"):
-        return f"{word[:-3]}y"
+        return word[:-3] + "y"
     if len(word) > 3 and word.endswith("s") and not word.endswith(("ss", "is", "us")):
         return word[:-1]
     return word
 
 
-def _report_match(label: str, question_names: set[str], years: set[str]) -> tuple[bool, bool]:
-    # A label like COMPANY_2022_10K can disambiguate equivalent disclosures.
-    name = []
-    year_match = False
-    for word in _WORDS.findall(label.casefold()):
-        if (year := _YEAR.fullmatch(word)) is not None:
-            year_match = year[1] in years
+def _clean_question(question: str) -> str:
+    clauses = re.split(r"(?<=[.;?])\s+", question)
+    kept = [clause for clause in clauses if not _INSTRUCTION.search(clause.casefold())]
+    return " ".join(kept) if kept else question
+
+
+def _question_terms(question: str) -> tuple[str, ...]:
+    words = (_stem(word) for word in _WORD.findall(_clean_question(question).casefold()))
+    seen: dict[str, None] = {}
+    for word in words:
+        if len(word) > 1 and word not in _STOP:
+            seen.setdefault(word, None)
+    return tuple(seen)
+
+
+def _company_grams(question: str) -> set[str]:
+    words = _WORD.findall(_clean_question(question).casefold())
+    grams: set[str] = set()
+    for start in range(len(words)):
+        for end in range(start + 1, min(start + 4, len(words)) + 1):
+            grams.add("".join(words[start:end]))
+    return grams
+
+
+def _company_key(document_id: str) -> tuple[tuple[str, ...], str]:
+    parts = []
+    for part in document_id.split("_"):
+        if _YEAR.fullmatch(part):
             break
-        if word in {"10k", "10q", "annual", "report"}:
-            break
-        name.append(word)
-    while name and name[-1] in {"inc", "co", "corp", "corporation", "plc", "ltd", "limited"}:
-        name.pop()
-    company = "".join(name)
-    return company in question_names or company.removeprefix("the") in question_names, year_match
+        if part:
+            parts.append(part.casefold())
+    return tuple(parts), "".join(parts)
 
 
-def _heading_score(topic: _Topic, lines: list[str]) -> int:
-    # An isolated heading is stronger evidence than a table-of-contents entry or
-    # a mention in a paragraph. Some reports place the heading below other items.
-    mentioned = False
-    for line in lines:
-        match = topic.evidence.search(line)
-        if match is not None:
-            if match.start() < 35 and len(line) - match.end() < 25:
-                return 4
-            mentioned = True
-    return int(mentioned)
+def _company_variants(document_id: str) -> set[str]:
+    parts, key = _company_key(document_id)
+    variants = {key, key.replace("and", "")}
+    if len(parts) >= 2:
+        variants.add("".join(part[0] for part in parts))
+        initials = {part[0] for part in parts}
+        if len(initials) == 1:
+            # J&J-style names are also written as JnJ / JandJ.
+            initial = next(iter(initials))
+            variants.update({f"{initial}n{initial}", f"{initial}and{initial}", f"{initial}&{initial}"})
+    return variants
 
 
-class _RankedPage(NamedTuple):
-    record: MemoryEntryRecord
-    report_match: tuple[bool, bool]
-    score: float
-    topics: tuple[float, ...]
+def _company_matches(document_id: str, grams: set[str]) -> bool:
+    if _company_variants(document_id) & grams:
+        return True
+    _, key = _company_key(document_id)
+    return any(len(gram) >= 4 and gram in key for gram in grams)
 
 
-def _rank_pdf_records(
-    records: list[MemoryEntryRecord],
-    terms: tuple[str, ...],
-    topics: tuple[_Topic, ...],
-    question_words: list[str],
-    fts_ranks: dict[str, int],
-) -> list[MemoryEntryRecord]:
-    """Rank complete pages using lexical matches, report identity and disclosure headings."""
+def _heading_zone(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()][:10]
+    return " ".join(lines).casefold()
 
-    if not records:
-        return []
-    question_names = {
-        "".join(question_words[start:end])
-        for start in range(len(question_words))
-        for end in range(start + 1, min(start + 4, len(question_words)) + 1)
-    }
-    years = {match[1] for word in question_words if (match := _YEAR.fullmatch(word)) is not None}
-    topic_terms = tuple(set(map(_term, topic.terms.split())) for topic in topics)
-    term_set = set(terms).union(*topic_terms)
-    pages = []
+
+class _Page(NamedTuple):
+    citation: MemoryCitation
+    source_id: str
+    version_id: str
+    document_id: str
+    counts: Counter[str]
+    length: int
+    zone: str
+    statements: frozenset[str]
+    sections: frozenset[str]
+    numeric: float
+
+
+class _Corpus(NamedTuple):
+    pages: tuple[_Page, ...]
+    frequencies: Counter[str]
+    total: int
+    average: float
+
+    def idf(self, term: str) -> float:
+        frequency = self.frequencies.get(term, 0)
+        return log(1 + (self.total - frequency + 0.5) / (frequency + 0.5))
+
+
+_CORPORA: dict[object, _Corpus] = {}
+
+
+async def _corpus_for(memory: ScopedMemoryApplication) -> _Corpus | None:
+    """Index one exact Memory snapshot once per scope and reuse it across questions."""
+
+    key = getattr(memory, "scope_id", None) or id(memory)
+    cached = _CORPORA.get(key)
+    if cached is not None:
+        return cached
+
+    snapshot = await memory.list()
+    pages: list[_Page] = []
     frequencies: Counter[str] = Counter()
-    for record in records:
-        label, _, body = record.entry.text.partition("\n")
-        body = body.casefold()
-        words = _WORDS.findall(body)
-        counts = Counter(term for word in words if (term := _term(word)) in term_set)
-        frequencies.update(counts.keys())
-        lines = [" ".join(_WORDS.findall(line)) for line in body.splitlines()] if topics else []
-        scores = tuple(
-            _heading_score(topic, lines) + 0.25 * len(counts.keys() & aliases)
-            for topic, aliases in zip(topics, topic_terms, strict=True)
+    for record in snapshot.entries:
+        pages.extend(_page_from_record(record, frequencies))
+    if not pages:
+        return None
+    total = len(pages)
+    average = sum(page.length for page in pages) / total
+    corpus = _Corpus(pages=tuple(pages), frequencies=frequencies, total=total, average=average)
+    if len(_CORPORA) >= _MAX_CACHED_SCOPES:
+        _CORPORA.pop(next(iter(_CORPORA)))
+    _CORPORA[key] = corpus
+    return corpus
+
+
+def _page_from_record(record: MemoryEntryRecord, frequencies: Counter[str]) -> list[_Page]:
+    sources = record.entry.sources
+    if len(sources) != 1 or sources[0].source_type != PDF_PAGE_SOURCE_TYPE:
+        return []
+    label, _, body = record.entry.text.partition("\n")
+    counts = Counter(_stem(word) for word in _WORD.findall(body.casefold()))
+    frequencies.update(counts.keys())
+    zone = _heading_zone(body)
+    statements = frozenset(kind for kind, pattern in _STATEMENTS.items() if pattern.search(zone))
+    if len(statements) >= 2:
+        # A table of contents lists several statements; only a real statement page
+        # carries one disclosure heading at the top of the page.
+        statements = frozenset()
+    sections = frozenset(name for name, pattern in _SECTIONS.items() if pattern.search(zone))
+    digits = sum(count for word, count in counts.items() if word.isdigit())
+    total = sum(counts.values())
+    return [
+        _Page(
+            citation=record.citation,
+            source_id=sources[0].source_id,
+            version_id=record.entry.entry_version_id,
+            document_id=label,
+            counts=counts,
+            length=total,
+            zone=zone,
+            statements=statements,
+            sections=sections,
+            numeric=digits / max(total, 1),
         )
-        pages.append((record, _report_match(label, question_names, years), len(words), counts, scores))
-
-    average_length = max(sum(length for _, _, length, _, _ in pages) / len(pages), 1)
-    weights = {term: log1p((len(pages) - frequencies[term] + 0.5) / (frequencies[term] + 0.5)) for term in terms}
-    ranked = []
-    for record, report_match, length, counts, scores in pages:
-        norm = 0.75 + 0.45 * length / average_length
-        score = sum(weight * counts[term] / (counts[term] + norm) for term, weight in weights.items())
-        if (rank := fts_ranks.get(record.entry.entry_version_id)) is not None:
-            score += 1 / (1 + 0.2 * rank)
-        if score or any(scores):
-            ranked.append(_RankedPage(record, report_match, score, scores))
-
-    # Reserve leading results for each disclosure when a question needs several
-    # statements. Otherwise terms repeated in one statement can crowd out another.
-    focused = [
-        sorted(
-            (row for row in ranked if row.topics[index] > 0),
-            key=lambda row: (row.report_match, row.topics[index], row.score),
-            reverse=True,
-        )[:2]
-        for index in range(len(topics))
     ]
-    preferred: dict[str, MemoryEntryRecord] = {}
-    best_report = max((row.report_match for row in ranked), default=(False, False))
-    for position in range(2):
-        for rows in focused:
-            if position < len(rows) and rows[position].report_match == best_report:
-                record = rows[position].record
-                preferred.setdefault(record.entry.entry_version_id, record)
-    for row in sorted(ranked, key=lambda row: (row.report_match, row.score + sum(row.topics)), reverse=True):
-        preferred.setdefault(row.record.entry.entry_version_id, row.record)
-    return list(preferred.values())
+
+
+def _rank_pages(
+    corpus: _Corpus,
+    question: str,
+    limit: int,
+    fts_ranks: dict[str, int],
+) -> list[_Page]:
+    terms = _question_terms(question)
+    if not terms or limit <= 0:
+        return []
+
+    grams = _company_grams(question)
+    documents = {page.document_id for page in corpus.pages}
+    matched = {document for document in documents if _company_matches(document, grams)}
+
+    lowered = question.casefold()
+    topic_statements: set[str] = set()
+    topic_sections: set[str] = set()
+    expansions: list[str] = []
+    for pattern, words in _LEXICON:
+        if pattern.search(lowered):
+            expansions.extend(words)
+    for pattern, kinds in _TOPIC_STATEMENTS:
+        if pattern.search(lowered):
+            topic_statements.update(kinds)
+    for pattern, names in _TOPIC_SECTIONS:
+        if pattern.search(lowered):
+            topic_sections.update(names)
+    expanded = {_stem(word) for word in terms}
+    for phrase in expansions:
+        expanded.update(_stem(word) for word in phrase.split() if word not in _STOP)
+    weights = {term: corpus.idf(term) for term in expanded}
+    numeric_question = _NUMERIC_QUESTION.search(lowered) is not None
+
+    scored: list[tuple[float, _Page]] = []
+    for page in corpus.pages:
+        lexical = 0.0
+        for term, weight in weights.items():
+            tf = page.counts.get(term, 0)
+            if tf:
+                lexical += weight * tf * (_K1 + 1) / (tf + _K1 * (1 - _B + _B * page.length / corpus.average))
+        if lexical <= 0:
+            continue
+        score = lexical
+        if topic_statements & page.statements:
+            score += _STATEMENT_BOOST
+        if topic_sections & page.sections:
+            score += _SECTION_BOOST
+        heading_hits = sum(1 for term in terms[:10] if term in page.zone)
+        if heading_hits:
+            score += _HEADING_BOOST * heading_hits
+        if numeric_question and page.numeric > 0.12:
+            score += _NUMERIC_BOOST
+        rank = fts_ranks.get(page.version_id)
+        if rank is not None:
+            # Lexical order stays authoritative; the store's own ranking only
+            # settles exact score ties between otherwise equivalent pages.
+            score += 0.001 / (1 + rank)
+        scored.append((score, page))
+
+    if not scored:
+        return []
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    # When the question names a company, its report's pages come first; a clear
+    # lexical majority of one report does the same for unnamed questions. The
+    # remaining reports stay available so a larger limit can still fill up.
+    dominant = None
+    if len(documents) > 1:
+        mass: Counter[str] = Counter()
+        for score, page in scored[:80]:
+            mass[page.document_id] += score
+        leading = mass.most_common(2)
+        if leading and (len(leading) == 1 or leading[0][1] > 1.6 * leading[1][1]):
+            dominant = leading[0][0]
+    preferred: list[set[str]] = []
+    if matched:
+        preferred.append(matched)
+    if dominant is not None and dominant not in matched:
+        preferred.append({dominant})
+
+    def tier(page: _Page) -> int:
+        for index, documents_in_tier in enumerate(preferred):
+            if page.document_id in documents_in_tier:
+                return index
+        return len(preferred)
+
+    scored.sort(key=lambda item: (tier(item[1]), -item[0]))
+
+    chosen: list[_Page] = []
+    seen: set[str] = set()
+
+    def take(page: _Page) -> None:
+        if page.source_id not in seen:
+            seen.add(page.source_id)
+            chosen.append(page)
+
+    # Reserve a few slots inside the preferred report for the primary statements a
+    # question implies, so one repeated term cannot crowd out the evidence page.
+    primary_tier = tier(scored[0][1])
+    preferred_pages = [item for item in scored if tier(item[1]) == primary_tier]
+    if topic_statements:
+        by_kind: dict[str, list[tuple[float, _Page]]] = defaultdict(list)
+        for item in preferred_pages:
+            for kind in item[1].statements & topic_statements:
+                by_kind[kind].append(item)
+        reserved = 0
+        for items in by_kind.values():
+            for item in items[:2]:
+                if reserved >= _MAX_STATEMENT_SLOTS:
+                    break
+                take(item[1])
+                reserved += 1
+    if topic_sections:
+        by_section: dict[str, list[tuple[float, _Page]]] = defaultdict(list)
+        for item in preferred_pages:
+            for name in item[1].sections & topic_sections:
+                by_section[name].append(item)
+        reserved = 0
+        for items in by_section.values():
+            for item in items[:2]:
+                if reserved >= _MAX_SECTION_SLOTS:
+                    break
+                take(item[1])
+                reserved += 1
+    for _, page in scored:
+        if len(chosen) >= limit:
+            break
+        take(page)
+    return chosen[:limit]
 
 
 async def search_pdf_pages(
@@ -368,44 +588,25 @@ async def search_pdf_pages(
 ) -> tuple[MemoryCitation, ...]:
     """Search a scoped Memory for distinct, exactly citable PDF pages."""
 
-    from powercontext.builtin.artifacts.search import analyze_fts_query
     from powercontext.builtin.runtime.models import SearchMemoryRequest
 
-    question_words = _WORDS.findall(question.casefold())
-    if limit <= 0 or not question_words:
+    if limit <= 0 or not question.strip():
+        return ()
+    corpus = await _corpus_for(memory)
+    if corpus is None:
         return ()
 
-    normalized = " ".join(question_words)
-    topics = tuple(topic for topic in _TOPICS if topic.question.search(normalized))
-    analyzed = analyze_fts_query(question.partition("?")[0] or question).split()
-    if not analyzed:
-        analyzed = analyze_fts_query(question).split()
-    terms = [word for word in analyzed if word not in _QUERY_FILLER and not _YEAR.fullmatch(word)]
-    query_words = tuple(dict.fromkeys(terms or analyzed))[:24]
+    fts_ranks: dict[str, int] = {}
+    query = " ".join(_question_terms(question)[:24])
+    if query:
+        try:
+            page = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=max(4 * limit, 64)))
+        except Exception:
+            page = None
+        if page is not None:
+            fts_ranks = {hit.entry_version_id: rank for rank, hit in enumerate(page.hits)}
 
-    # FTS is useful for literal matches, but its admission and top-k apply to
-    # the whole scope. Rank the PDF records from one exact Memory snapshot as
-    # well, so another report or a synonym cannot exclude the evidence page.
-    hits = await memory.search(SearchMemoryRequest(query=" ".join(query_words), mode="fts", limit=max(4 * limit, 64)))
-    snapshot = await memory.list()
-    pages = [
-        record
-        for record in snapshot.entries
-        if len(record.entry.sources) == 1 and record.entry.sources[0].source_type == PDF_PAGE_SOURCE_TYPE
-    ]
-    fts_ranks = (
-        {hit.entry_version_id: rank for rank, hit in enumerate(hits.hits)}
-        if hits.memory_ref == snapshot.memory_ref
-        else {}
-    )
-    rank_terms = tuple(dict.fromkeys(map(_term, query_words)))
-    citations: dict[str, MemoryCitation] = {}
-    for record in _rank_pdf_records(pages, rank_terms, topics, question_words, fts_ranks):
-        source_id = record.entry.sources[0].source_id
-        citations.setdefault(source_id, record.citation)
-        if len(citations) == limit:
-            break
-    return tuple(citations.values())
+    return tuple(page.citation for page in _rank_pages(corpus, question, limit, fts_ranks))
 
 
 __all__ = ["PDF_PAGE_SOURCE_DEFINITION", "PDFDocumentInput", "PDFPageInput", "parse_pdf_document", "search_pdf_pages"]
