@@ -1,0 +1,81 @@
+exit=1
+............FFFF.F.                                                      [100%]
+================================== FAILURES ===================================
+_______ ReservationTTLTests.test_commit_after_expiration_returns_false ________
+
+self = <test_ttl.ReservationTTLTests testMethod=test_commit_after_expiration_returns_false>
+
+    def test_commit_after_expiration_returns_false(self) -> None:
+        self.service.add_stock("sku-1", 5)
+        reservation = self.service.reserve("sku-1", 2, ttl_seconds=10)
+    
+        self.clock.advance(10)
+    
+>       self.assertFalse(self.service.commit(reservation.reservation_id))
+E       AssertionError: True is not false
+
+tests\test_ttl.py:76: AssertionError
+____ ReservationTTLTests.test_expired_reservation_restores_available_stock ____
+
+self = <test_ttl.ReservationTTLTests testMethod=test_expired_reservation_restores_available_stock>
+
+    def test_expired_reservation_restores_available_stock(self) -> None:
+        self.service.add_stock("sku-1", 5)
+        reservation = self.service.reserve("sku-1", 3, ttl_seconds=10)
+    
+        self.assertEqual(self.service.get_available("sku-1"), 2)
+    
+        self.clock.advance(10)
+    
+>       self.assertEqual(self.service.get_available("sku-1"), 5)
+E       AssertionError: 2 != 5
+
+tests\test_ttl.py:51: AssertionError
+_______ ReservationTTLTests.test_non_integer_ttl_raises_inventory_error _______
+
+self = <test_ttl.ReservationTTLTests testMethod=test_non_integer_ttl_raises_inventory_error>
+
+    def test_non_integer_ttl_raises_inventory_error(self) -> None:
+        self.service.add_stock("sku-1", 5)
+    
+        for ttl_seconds in (1.5, "10", True):
+            with self.subTest(ttl_seconds=ttl_seconds):
+                with self.assertRaises(InventoryError):
+>                   self.service.reserve("sku-1", 1, ttl_seconds=ttl_seconds)
+E                   AssertionError: InventoryError not raised
+
+tests\test_ttl.py:99: AssertionError
+______ ReservationTTLTests.test_non_positive_ttl_raises_inventory_error _______
+
+self = <test_ttl.ReservationTTLTests testMethod=test_non_positive_ttl_raises_inventory_error>
+
+    def test_non_positive_ttl_raises_inventory_error(self) -> None:
+        self.service.add_stock("sku-1", 5)
+    
+        for ttl_seconds in (0, -1):
+            with self.subTest(ttl_seconds=ttl_seconds):
+                with self.assertRaises(InventoryError):
+>                   self.service.reserve("sku-1", 1, ttl_seconds=ttl_seconds)
+E                   AssertionError: InventoryError not raised
+
+tests\test_ttl.py:89: AssertionError
+_______ ReservationTTLTests.test_release_after_expiration_returns_false _______
+
+self = <test_ttl.ReservationTTLTests testMethod=test_release_after_expiration_returns_false>
+
+    def test_release_after_expiration_returns_false(self) -> None:
+        self.service.add_stock("sku-1", 5)
+        reservation = self.service.reserve("sku-1", 2, ttl_seconds=10)
+    
+        self.clock.advance(10)
+    
+>       self.assertFalse(self.service.release(reservation.reservation_id))
+E       AssertionError: True is not false
+
+tests\test_ttl.py:63: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_ttl.py::ReservationTTLTests::test_commit_after_expiration_returns_false - AssertionError: True is not false
+FAILED tests/test_ttl.py::ReservationTTLTests::test_expired_reservation_restores_available_stock - AssertionError: 2 != 5
+FAILED tests/test_ttl.py::ReservationTTLTests::test_non_integer_ttl_raises_inventory_error - AssertionError: InventoryError not raised
+FAILED tests/test_ttl.py::ReservationTTLTests::test_non_positive_ttl_raises_inventory_error - AssertionError: InventoryError not raised
+FAILED tests/test_ttl.py::ReservationTTLTests::test_release_after_expiration_returns_false - AssertionError: True is not false

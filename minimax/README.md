@@ -106,6 +106,9 @@ python tools/pipeline.py --ingest
 | `07-pytest-split.txt` | 回归用例 / 新增功能用例分开统计 |
 | `08-summary.json` | 结论汇总 |
 | `minimax-calls.jsonl` | 每次 MiniMax 调用的 URL、模型、耗时、usage、请求与响应 |
+| `09-self-repair.md` | 自修复通道验证：注入 2 处缺陷 → 5 failed → MiniMax 一轮修复 → 19 passed |
+| `09-pytest-buggy.txt` / `09-pytest-after-repair.txt` | 上述两轮的 pytest 原始输出 |
+| `09-repair-calls.jsonl` | 该轮修复的 MiniMax 调用记录（请求 / 响应 / usage） |
 
 ## 验证样例
 
@@ -130,6 +133,10 @@ after_exit=exit=0  repair_rounds=0
 ```
 
 ## 技术使用记录
+
+除主流程的 2 次改码调用外，`evidence/09-*` 另记录了一次自修复调用：人工注入 2 处缺陷
+（漏 TTL 校验、过期回收延后 60 秒）后 5 个用例失败，把 pytest 输出回喂 MiniMax，
+一轮修复后恢复 19 passed，用于验证「失败自修复」通道确实可用。
 
 `evidence/minimax-calls.jsonl` 每行一次调用，包含：时间戳、接口 URL、模型名、耗时、`usage`、
 完整 `request`（system + user prompt）与完整 `response`。可直接用 jq 复核：
